@@ -47,9 +47,14 @@ def exclusions():
                               '-W'],
                              close_fds=True, stdout=subprocess.PIPE)
         for line in p.stdout:
-            package, property = line.rstrip().split()
-            if property in ('yes', 'important', 'required', 'standard'):
-                s.add(package)
+            try:
+                line = line.rstrip()
+                package, property = line.rstrip().split()
+                if property in ('yes', 'important', 'required', 'standard'):
+                    s.add(package)
+            except ValueError:
+                logging.warning('Package {0} has no {1} field, ignoring.'
+                        ''.format(line, field))
 
     # Walk the dependency tree all the way to the leaves.
     tmp_s = s
