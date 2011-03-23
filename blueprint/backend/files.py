@@ -11,6 +11,7 @@ import hashlib
 import logging
 import os.path
 import pwd
+import re
 import stat
 import subprocess
 
@@ -131,61 +132,42 @@ def files(b):
         for dirname in dirnames:
             ctimes[os.lstat(os.path.join(dirpath, dirname)).st_ctime] += 1
 
-        for pathname, s in files:
+        for filename, s in files:
 
             # Ignore files that match in the `gitignore`(5)-style
             # `~/.blueprintignore` file.  Default to ignoring files that
             # share their ctime with other files in the directory.  This
             # is a very strong indication that the file is original to
             # the system and should be ignored.
-            if _ignore(pathname, ignored=ignored or 1 < ctimes[s.st_ctime]):
+            if _ignore(filename, ignored=ignored or 1 < ctimes[s.st_ctime]):
                 continue
 
             # The content is used even for symbolic links to determine whether
             # it has changed from the packaged version.
             try:
-                content = open(pathname).read()
+                content = open(filename).read()
             except IOError:
                 #logging.warning('{0} not readable'.format(pathname))
                 continue
 
-            # Ignore files that are from the `base-files` package (which
-            # doesn't include MD5 sums for every file for some reason),
-            # unchanged from their packaged version, or match in `MD5SUMS`.
-            packages = _dpkg_query_S(pathname)
-            if 'base-files' in packages:
+            # Ignore files that are known to come from system packages.
+
+            if _is_known_file(filename, content):
                 continue
-            if 0 < len(packages):
-                md5sums = [_dpkg_md5sum(package, pathname)
-                           for package in packages]
-            elif pathname in MD5SUMS:
-                if '/' == MD5SUMS[pathname][0]:
-                    try:
-                        md5sums = [hashlib.md5(open(
-                            MD5SUMS[pathname]).read()).hexdigest()]
-                    except IOError:
-                        md5sums = []
-                else:
-                    md5sums = [MD5SUMS[pathname]]
-            else:
-                md5sums = []
-            if hashlib.md5(content).hexdigest() in md5sums:
-                if _ignore(pathname, ignored=True):
-                    continue
 
             # Don't store DevStructure's default `/etc/fuse.conf`.  (This is
             # a legacy condition.)
-            if '/etc/fuse.conf' == pathname:
+            if '/etc/fuse.conf' == filename:
                 try:
-                    if 'user_allow_other\n' == open(pathname).read():
-                        if _ignore(pathname, ignored=True):
+                    if 'user_allow_other\n' == open(filename).read():
+                        if _ignore(filename, ignored=True):
                             continue
                 except IOError:
                     pass
 
             # A symbolic link's content is the link target.
             if stat.S_ISLNK(s.st_mode):
-                content = os.readlink(pathname)
+                content = os.readlink(filename)
 
                 # Ignore symbolic links providing backwards compatibility
                 # between SystemV init and Upstart.
@@ -213,7 +195,7 @@ def files(b):
             # a blueprint and really shouldn't appear in `/etc` at all.
             else:
                 logging.warning('{0} is not a regular file or symbolic link'
-                                ''.format(pathname))
+                                ''.format(filename))
                 continue
 
             try:
@@ -226,20 +208,19 @@ def files(b):
                 group = gr.gr_name
             except KeyError:
                 group = s.st_gid
-            b.files[pathname] = dict(content=content,
+            b.files[filename] = dict(content=content,
                                      encoding=encoding,
                                      group=group,
                                      mode='{0:o}'.format(s.st_mode),
                                      owner=owner)
 
 
-def _ignore(pathname, ignored=False):
+def _ignore(filename, ignored=False):
     """
     Return `True` if the `gitignore`(5)-style `~/.blueprintignore` file says
     the given file should be ignored.  The starting state of the file may be
     overridden by setting `ignored` to `True`.
     """
-
     # Cache the patterns stored in the `~/.blueprintignore` file.
     if not hasattr(_ignore, '_cache'):
         _ignore._cache = [(pattern, False) for pattern in IGNORE]
@@ -257,15 +238,15 @@ def _ignore(pathname, ignored=False):
 
     # Determine if the `pathname` matches the `pattern`.  `filename` is
     # given as a convenience.  See `gitignore`(5) for the rules in play.
-    def match(filename, pathname, pattern):
+    def match(basename, filename, pattern):
         dir_only = '/' == pattern[-1]
         pattern = pattern.rstrip('/')
         if -1 == pattern.find('/'):
-            if fnmatch.fnmatch(filename, pattern):
-                return os.path.isdir(pathname) if dir_only else True
+            if fnmatch.fnmatch(basename, pattern):
+                return os.path.isdir(filename) if dir_only else True
         else:
             for p in glob.glob(os.path.join('/etc', pattern)):
-                if pathname == p or pathname.startswith('{0}/'.format(p)):
+                if filename == p or filename.startswith('{0}/'.format(p)):
                     return True
         return False
 
@@ -273,69 +254,142 @@ def _ignore(pathname, ignored=False):
     # over inclusion rules that appear later.  If there are no matches,
     # include the file.  If only an exclusion rule matches, exclude the
     # file.  If an inclusion rule also matches, include the file.
-    filename = os.path.basename(pathname)
+    basename = os.path.basename(filename)
     for pattern, negate in _ignore._cache:
         if ignored != negate:
             continue
         if ignored:
-            if match(filename, pathname, pattern):
+            if match(basename, filename, pattern):
                 return False
         else:
-            ignored = match(filename, pathname, pattern)
+            ignored = match(basename, filename, pattern)
 
     return ignored
 
 
-def _dpkg_query_S(pathname):
+def _is_known_file(filename, content):
     """
-    Return a list of package names that contain `pathname` or `[]`.  This
-    really can be a list thanks to `dpkg-divert`(1).
+    Checks if given filename is known to the system.
+    Returns True if the file and the content is known, otherweise False
+
     """
+    packages = _dpkg_query_S(filename)
+    # Ignore files that are from the `base-files` package (which
+    # doesn't include MD5 sums for every file for some reason),
+    # unchanged from their packaged version, or match in `MD5SUMS`.
+    for package in packages:
+        if 'base-files' == package:
+            return True
+
+    for md5sum in _get_md5sums(filename):
+        if hashlib.md5(content).hexdigest() == md5sum:
+            if _ignore(filename, ignored=True):
+                return True
+
+    return False
+
+
+def _dpkg_query_S(filename):
+    """
+    Return a list of the packages that contains `filename` or an empty list.
+    Due to divert (dpkg-divert(8)) this returns either a list of packages
+    for a specific file or a empty tumple if no package can be determined.
+    """
+
+    # build the cache
+    if not hasattr(_dpkg_query_S, '_cache'):
+        _dpkg_query_S._cache = {}
+        cache = _dpkg_query_S._cache
+        for p in glob.glob('/var/lib/dpkg/info/*.list'):
+            package = os.path.basename(p).split('.list')[0]
+            for line in open(p):
+                name = line.rstrip()
+                if name in cache:
+                    cache[name].append(package)
+                else:
+                    cache[name] = [package]
+    else:
+        cache = _dpkg_query_S._cache
+
     try:
-        p = subprocess.Popen(['dpkg-query', '-S', pathname],
-                             close_fds=True,
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
-    except OSError:
-        return None
-    stdout, stderr = p.communicate()
-    if 0 != p.returncode:
-
-        # If `pathname` isn't in a package but is a symbolic link, see if
-        # the symbolic link is in a package.  `postinst` programs commonly
-        # display this pattern.
+        return cache[filename]
+    except KeyError:
         try:
-            return _dpkg_query_S(os.readlink(pathname))
-
+            return _dpkg_query_S(os.readlink(filename))
         except OSError:
             return []
-    packages = []
-    for line in stdout.splitlines():
-        if line.startswith('diversion '):
-            continue
+    return []
+
+
+def _get_md5sums(filename):
+    """
+    Returns a set of available MD5 sums for a given file.
+    Due to dpkg-divert(8) one file may have multiple MD5 sums.
+    """
+
+    md5sums = []
+    packages = _dpkg_query_S(filename)
+    if packages:
+        md5sums += _dpkg_status_md5sum(filename)
+        for package in packages:
+            md5sums.append(_dpkg_md5sum(package, filename))
+
+    if filename in MD5SUMS:
+        md5sum = MD5SUMS[filename]
         try:
-            p, _ = line.split(':', 1)
-            packages.extend([package.strip() for package in p.split(',')])
-        except ValueError:
+            if '/' == md5sum[0]:  # md5sum seems to be a file -> read file
+                md5sum = hashlib.md5(open(md5sum).read()).hexdigest()
+        except IOError:
             pass
-    return packages
+        finally:
+            md5sums.append(md5sum)
+
+    return set(md5sums)
 
 
-def _dpkg_md5sum(package, pathname):
+def _dpkg_status_md5sum(filename):
+    """
+    Return the MD5 sum from /var/lib/dpkg/status. The hashes are cached.
+    Returns a list of MD5 sums for the specified `filename` or a empty
+    list if `filename` was not found in /var/lib/dpkg/status
+    This function does _not_ call dpkg -S but mimics its behaviour.
+
+    This function returns a list of md5sums since multiple packages
+    can install the same package in debian
+
+    """
+    if not hasattr(_dpkg_status_md5sum, '_cache'):
+        _dpkg_status_md5sum._cache = {}
+        _cache = _dpkg_status_md5sum._cache
+        try:
+            pattern = re.compile(r'^ ([\w/_:.-]*) ([\w]{32})( [\w]*)?$')
+            for line in open('/var/lib/dpkg/status'):
+                match = pattern.match(line)
+                if not match:
+                    continue
+                try:
+                    _cache[match.group(1)].append(match.group(2))
+                except KeyError:
+                    _cache[match.group(1)] = [match.group(2)]
+        except IOError:
+            pass
+    else:
+        _cache = _dpkg_status_md5sum._cache
+    try:
+        return _cache[filename]
+    except KeyError:
+        return []
+
+
+def _dpkg_md5sum(package, filename):
     """
     Find the MD5 sum of the packaged version of pathname or `None` if the
     `pathname` does not come from a Debian package.
     """
     try:
         for line in open('/var/lib/dpkg/info/{0}.md5sums'.format(package)):
-            if line.endswith('{0}\n'.format(pathname[1:])):
+            if line.endswith('{0}\n'.format(filename[1:])):
                 return line[0:32]
-    except IOError:
-        pass
-    try:
-        for line in open('/var/lib/dpkg/status'):
-            if line.startswith(' {0} '.format(pathname)):
-                return line[-33:-1]
     except IOError:
         pass
     return None
