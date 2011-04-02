@@ -19,6 +19,7 @@ import subprocess
 #
 # XXX Update `blueprintignore`(5) if you make changes here.
 IGNORE = ('*.dpkg-*',
+          '*.ucf-*',
           '/etc/.git',
           '/etc/.pwd.lock',
           '/etc/alternatives',
